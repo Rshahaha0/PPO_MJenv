@@ -1150,6 +1150,11 @@ class MahjongEnv:
             eff = max(0.0, min(100.0, delta))
             raw_reward = self.reward_weights["efficiency"] * (0.5 - eff / 100.0)
         raw_reward *= (1.0 - self.terminal_focus)
+        try:
+            with open("贏局分析.txt", "a", encoding="utf-8") as f_log:
+                f_log.write(f"{self.terminal_focus:.4f}, {raw_reward:.6f}\n")
+        except Exception:
+            pass
         return self._clip_and_normalize(raw_reward)
     def potential(self, player_idx: int = 0) -> float:
         hand = self.players[player_idx]['hand'][:]
@@ -1482,11 +1487,11 @@ class LongTermWinRateBonus:
     def bonus(self, terminal_focus: float = 0.0) -> float:
         scale = (0.5 + 0.5 * terminal_focus)
         bonus_val = scale * self.alpha * (self.current_rate ** 1.5) * 3.0
-        return bonus_val * 8.0 
+        return bonus_val * 8.0
 # ===== RL 訓練包裝：MahjongRLTrainEnvV2 =====
 class MahjongRLTrainEnvV2(gym.Env):
     metadata = {"render_modes": []}
-    def __init__(self, log_path="勝局紀錄.txt", log_enabled=True, winrate_window=3000, winrate_alpha=2.0):
+    def __init__(self, log_path="贏局分析.txt", log_enabled=True, winrate_window=3000, winrate_alpha=2.0):
         super().__init__()
         self.env = MahjongEnv()
         self.action_space = spaces.Discrete(274)
@@ -2243,7 +2248,7 @@ class TrainingPlotCallback(BaseCallback):
         # --- Explained Variance ---
         if self.explained_variance:
             axes[1, 1].plot(self.updates, self.explained_variance, label="解釋變異 (Explained Variance)", color="green")
-            axes[1, 1].set_title("解釋變異")
+            axes[1, 1].set_title("解釋變異 (Explained Variance)")
             axes[1, 1].set_xlabel("更新次數")
             axes[1, 1].legend()
             self._apply_dynamic_margin(axes[1, 1], self.explained_variance)
