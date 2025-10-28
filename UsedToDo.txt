@@ -1,9 +1,12 @@
-===== 初次環境建立 =====
+===== venv =====
 python -m venv venv
 venv\Scripts\activate
 
+===== 必要安裝 =====
 pip install -r requirements.txt
 pip install tensorboard
+----- 中文字形 -----
+https://fonts.google.com/selection?query=Noto+Sans+TC
 
 ===== 執行/中斷程式 =====
 python rl.py
