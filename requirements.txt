@@ -4,3 +4,4 @@ gymnasium>=0.29.1
 numpy
 torch
 matplotlib
+tensorboard

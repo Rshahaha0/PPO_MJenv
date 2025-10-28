@@ -54,7 +54,7 @@ ID_CONC_KONG_START = 240
 ID_CONC_KONG_END = 273
 # ========= RewardNet: 學習型 Reward 函式 =========
 class RewardNet(nn.Module):
-    def __init__(self, input_dim=374, action_dim=274, hidden_size=256, noise_std=0.02, residual_scale=0.10):
+    def __init__(self, input_dim=374, action_dim=274, hidden_size=256, noise_std=0.01, residual_scale=0.10):
         super().__init__()
         self.noise_std = noise_std
         self.residual_scale = residual_scale
@@ -116,15 +116,15 @@ class MahjongEnv:
         self.passed_players_for_current_discard = set()
         self.reward_weights = {
             "efficiency": 0.6,
-            "ron": 12.0,
-            "tsumo": 14.0,
-            "lose_ron": -14.0,
-            "lose_tsumo": -9.0,
-            "chi": 0.1,
-            "pong": 0.15,
-            "ming_kong": 0.3,
-            "add_kong": 0.3,
-            "concealed_kong": 0.5
+            "ron": 13.0,
+            "tsumo": 15.0,
+            "lose_ron": -18.0,
+            "lose_tsumo": -12.0,
+            "chi": 0.2,
+            "pong": 0.25,
+            "ming_kong": 0.4,
+            "add_kong": 0.4,
+            "concealed_kong": 0.65
         }
     def reset(self):
         self.deck = [i for i in range(34) for _ in range(4)]
@@ -1712,7 +1712,7 @@ class MahjongRLTrainEnvV2(gym.Env):
                     with th.no_grad():
                         pred_r = self.reward_net(obs_tensor, act_tensor).item()
                     shape = math.tanh(delta_eff / 20.0)
-                    reward_val = 0.75 * pred_r + 0.25 * shape
+                    reward_val = 0.85 * pred_r + 0.15 * shape
                 else:
                     reward_val = e.compute_reward_for_action(act_type, delta_eff)
                 reward += reward_val
@@ -1758,7 +1758,7 @@ class MahjongRLTrainEnvV2(gym.Env):
                     with th.no_grad():
                         pred_r = self.reward_net(obs_tensor, act_tensor).item()
                     eff = e.last_discard_efficiency if e.last_discard_efficiency is not None else 0.0
-                    shape = math.tanh((50.0 - eff) / 25.0)
+                    shape = math.tanh((60.0 - eff) / 30.0)
                     reward_val = 0.75 * np.clip(pred_r, -1.0, 1.0) + 0.25 * shape
                     reward += reward_val
                     self._log_player_action(
@@ -2049,7 +2049,7 @@ class MahjongRLTrainEnvV2(gym.Env):
 #       EntropyAnnealCallback：動態調整熵係數
 # ==============================================================
 class EntropyAnnealCallback(BaseCallback):
-    def __init__(self, total_timesteps, ent_coef_min=0.004, ent_coef_max=0.015):
+    def __init__(self, total_timesteps, ent_coef_min=0.008, ent_coef_max=0.04):
         super().__init__()
         self.total_timesteps = total_timesteps
         self.ent_coef_min = ent_coef_min
@@ -2070,11 +2070,11 @@ class JointTrainCallback(BaseCallback):
     def __init__(
         self,
         reward_trainer,
-        update_freq=5000,
-        warmup_steps=20000,
+        update_freq=8000,
+        warmup_steps=30000,
         max_cache=3,
-        freeze_after=0.8,
-        total_timesteps=1_000_000,
+        freeze_after=0.9,
+        total_timesteps=3_000_000,
         verbose=0
     ):
         super().__init__(verbose)
@@ -2118,10 +2118,10 @@ class JointTrainCallback(BaseCallback):
         return True
 # ========= RewardNet 的訓練器 =========
 class RewardTrainer:
-    def __init__(self, reward_net, lr=2e-4):
+    def __init__(self, reward_net, lr=1e-4):
         self.reward_net = reward_net
         self.optimizer = th.optim.AdamW(reward_net.parameters(), lr=lr, weight_decay=1e-5)
-        self.loss_fn = th.nn.SmoothL1Loss(reduction="none", beta=0.5)
+        self.loss_fn = th.nn.SmoothL1Loss(reduction="none", beta=0.8)
         self.step_count = 0
         self.prev_target = None
     def update(self, obs_batch, act_batch, ret_batch):
@@ -2155,12 +2155,16 @@ class RewardTrainer:
         std_tgt = ret_batch.std().detach()
         std_pred = pred.std()
         std_reg = (std_pred - std_tgt).pow(2)
-        reg_l2 = 1e-4 * sum(p.pow(2.0).sum() for p in self.reward_net.parameters())
+        grad_reg = 0.0
+        if len(pred) > 1:
+            grad_reg = (pred[:-1] - pred[1:]).pow(2).mean() * 0.01
+        reg_l2 = 1e-5 * sum(p.pow(2.0).sum() for p in self.reward_net.parameters())
         loss = (
             loss_main
             + 0.05 * mean_reg
             + 0.05 * std_reg
             + 0.2 * sign_loss
+            + grad_reg
             + reg_l2
         )
         if th.isnan(loss):
@@ -2175,7 +2179,7 @@ class RewardTrainer:
                 f"🧩 RewardNet Debug | loss={loss.item():.6f} | "
                 f"pred_mean={pred.mean().item():+.4f} | pred_std={pred.std().item():.4f} | "
                 f"ret_mean={ret_batch.mean().item():+.4f} | ret_std={ret_batch.std().item():.4f} | "
-                f"sign_loss={sign_loss.item():.4f}"
+                f"sign_loss={sign_loss.item():.4f} | grad_reg={grad_reg:.6f}"
             )
         return loss.item()
 # ===== 便捷包裝，和舊訓練腳本相同操作介面 =====
@@ -2495,7 +2499,7 @@ if __name__ == "__main__":
         env.norm_reward = True
         print(f"🔁 已載入 VecNormalize：models/{base_version}/vecnorm.pkl")
     else:
-        env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+        env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_reward=10.0)
         env.training = True
         env.norm_reward = True
         print("🧮 初始化 VecNormalize（norm_obs=False, norm_reward=True）")
@@ -2509,13 +2513,13 @@ if __name__ == "__main__":
         print("⚙️ 新建 RewardNet 權重")
     env.envs[0].env.reward_net = reward_net
     def lr_schedule(progress_remaining: float) -> float:
-        return 3e-5 + (2e-4 - 3e-5) * progress_remaining
+        return 2e-5 + (1e-4 - 2e-5) * progress_remaining
     policy_kwargs = dict(
-        net_arch=[dict(pi=[256, 256], vf=[512, 512, 256])],
+        net_arch=[dict(pi=[256, 256], vf=[512, 256])],
         activation_fn=th.nn.Tanh,
         ortho_init=False
     )
-    gamma_value = 0.997
+    gamma_value = 0.999
     model = MaskablePPO(
         "MlpPolicy",
         env,
@@ -2526,11 +2530,11 @@ if __name__ == "__main__":
         batch_size=2048,
         n_epochs=4,
         gamma=gamma_value,
-        gae_lambda=0.95,
-        clip_range=0.25,
+        gae_lambda=0.98,
+        clip_range=0.2,
         clip_range_vf=0.2,
         ent_coef=0.02,
-        vf_coef=0.5,
+        vf_coef=0.8,
         max_grad_norm=0.8,
         target_kl=0.03,
         tensorboard_log=f"./tensorboard/",
@@ -2539,20 +2543,20 @@ if __name__ == "__main__":
         print(f"📦 載入模型權重：models/{base_version}/model.zip")
         old_model = MaskablePPO.load(f"models/{base_version}/model", env=env)
         model.policy.load_state_dict(old_model.policy.state_dict())
-    total_steps = 1_000_000
+    total_steps = 3_000_000
     plot_cb = TrainingPlotCallback(plot_path=f"models/{version}/training_plot.png")
     anneal_cb = EntropyAnnealCallback(
         total_timesteps=total_steps,
         ent_coef_min=0.008,
-        ent_coef_max=0.02
+        ent_coef_max=0.04
     )
-    reward_trainer = RewardTrainer(env.envs[0].env.reward_net, lr=2e-4)
+    reward_trainer = RewardTrainer(env.envs[0].env.reward_net, lr=1e-4)
     joint_cb = JointTrainCallback(
         reward_trainer,
-        update_freq=20_000,
-        warmup_steps=80_000,
-        freeze_after=0.8,
-        total_timesteps=1_000_000
+        update_freq=5_000,
+        warmup_steps=40_000,
+        freeze_after=0.85,
+        total_timesteps=3_000_000
     )
     reset_flag = (base_version is None)
     model.learn(
