@@ -3,6 +3,7 @@ import os
 import json
 import copy
 import random
+import platform
 import unicodedata
 import subprocess
 import torch as th
@@ -29,6 +30,9 @@ def pad_str_fixed_width(s, width):
         for ch in s:
             length += 2 if unicodedata.east_asian_width(ch) in ('F', 'W') else 1
         return s + ' ' * max(0, width - length)
+# ===== 中文字體 =====
+plt.rcParams['font.sans-serif'] = ['Noto Sans CJK TC']
+plt.rcParams['axes.unicode_minus'] = False
 # ---- 全域動作 ID 常數 ----
 ID_DISCARD_START = 0
 ID_DISCARD_END = 33
@@ -2191,21 +2195,42 @@ def get_latest_version(path="models"):
 # === 中文字體設定 ===
 def set_chinese_font():
     plt.rcParams["axes.unicode_minus"] = False
-    font_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
-    if not os.path.exists(font_path):
-        print("⚙️ 安裝中文字體中 (fonts-noto-cjk)...")
-        subprocess.run(
-            ["apt-get", "-y", "install", "fonts-noto-cjk"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-    if os.path.exists(font_path):
-        font_manager.fontManager.addfont(font_path)
+    system = platform.system()
+    font_path = None
+    if system == "Windows":
+        candidates = [
+            r"C:\Windows\Fonts\NotoSansCJK-Regular.ttc",
+            r"C:\Windows\Fonts\NotoSansTC-Regular.otf",
+            r"C:\Windows\Fonts\msjh.ttc",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                font_path = path
+                break
+        if not font_path:
+            print("⚠️ Windows 系統未找到中文字型，請手動安裝 Noto Sans CJK 或使用系統字體。")
+            font_family = "Microsoft JhengHei"
+        else:
+            zh_font = font_manager.FontProperties(fname=font_path)
+            font_family = zh_font.get_name()
+    elif system == "Linux":
+        font_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+        if not os.path.exists(font_path):
+            print("⚙️ 安裝中文字體中 (fonts-noto-cjk)...")
+            subprocess.run(
+                ["sudo", "apt-get", "-y", "install", "fonts-noto-cjk"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
         zh_font = font_manager.FontProperties(fname=font_path)
-        matplotlib.rcParams["font.family"] = zh_font.get_name()
-        matplotlib.rcParams["font.sans-serif"] = [zh_font.get_name()]
-        print(f"✅ 成功載入中文字體: {zh_font.get_name()}")
+        font_family = zh_font.get_name()
+    elif system == "Darwin":
+        font_path = "/System/Library/Fonts/STHeiti Light.ttc"
+        font_family = "Heiti TC"
     else:
-        print("⚠️ 找不到字體檔案，仍可能出現亂碼。")
+        font_family = "sans-serif"
+    plt.rcParams["font.family"] = font_family
+    plt.rcParams["font.sans-serif"] = [font_family]
+    print(f"✅ 成功設定中文字體：{font_family}")
 set_chinese_font()
 # ===== TrainingPlotCallback =====
 class TrainingPlotCallback(BaseCallback):
@@ -2491,8 +2516,6 @@ if __name__ == "__main__":
         ortho_init=False
     )
     gamma_value = 0.997
-    tensorboard_dir = f"./tensorboard/PPO_{version}"
-    os.makedirs(tensorboard_dir, exist_ok=True)
     model = MaskablePPO(
         "MlpPolicy",
         env,
@@ -2510,7 +2533,7 @@ if __name__ == "__main__":
         vf_coef=0.5,
         max_grad_norm=0.8,
         target_kl=0.03,
-        tensorboard_log=tensorboard_dir,
+        tensorboard_log=f"./tensorboard/",
     )
     if base_version and os.path.exists(f"models/{base_version}/model.zip"):
         print(f"📦 載入模型權重：models/{base_version}/model.zip")
@@ -2531,7 +2554,6 @@ if __name__ == "__main__":
         freeze_after=0.8,
         total_timesteps=1_000_000
     )
-    print(f"🚀 開始訓練 {version}，TensorBoard 目錄：{tensorboard_dir}")
     reset_flag = (base_version is None)
     model.learn(
         total_timesteps=total_steps,
@@ -2550,5 +2572,4 @@ if __name__ == "__main__":
         }, f, ensure_ascii=False, indent=2)
     print(f"✅ 訓練完成並儲存版本：{version}")
     print(f"💾 已儲存 VecNormalize：{vecnorm_path}")
-    print(f"💾 TensorBoard 資料夾：{tensorboard_dir}")
     env.close()
