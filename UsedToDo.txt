@@ -1,0 +1,11 @@
+===== 初次環境建立 =====
+python -m venv venv
+venv\Scripts\activate
+
+pip install -r requirements.txt
+pip install tensorboard
+
+===== 執行/中斷程式 =====
+python rl.py
+
+中斷執行：Ctrl + C
