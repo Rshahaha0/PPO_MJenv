@@ -4,8 +4,6 @@ venv\Scripts\activate
 
 ===== 必要安裝 =====
 pip install -r requirements.txt
------ 中文字形 -----
-https://fonts.google.com/download/next-steps?query=Noto+Sans+Chinese+J
 
 ===== 執行/中斷程式 =====
 python rl.py
