@@ -1,19 +1,34 @@
+# ============================================================
+#  rl.py  — 麻將強化學習環境
+# ============================================================
+# ------------------------------------------------------------
+#  整體架構導覽：
+#  1. RewardNet ------------------- 學習型獎勵模型 (state, action → reward)
+#  2. MahjongEnv ------------------ 台麻核心邏輯 + 出牌效率評估 + 獎勵函式
+#     - reward: 各動作對應的加權獎勵
+#     - state: 目前局面 (手牌 / 棄牌 / 副露 / 暗槓)
+#     - action: 各種動作 ("出", "碰", "槓", "胡", "過")
+#     - action mask: 274 維可執行動作遮罩 (供 MaskablePPO 使用)
+#  3. MahjongRLTrainEnvV2 -------- Gym 環境封裝 + 強化學習 step 流程
+#     - reward shaping: φ(s) 潛能差分強化
+#     - intrinsic reward: RewardNet 給的探索獎勵
+#     - terminal bonus: 胡 / 放槍 / 自摸 / 被自摸 結算獎勵
+#  4. RewardTrainer / Callbacks --- RewardNet 更新機制 + PPO entropy 動態調整
+#  5. Main ------------------------ 互動式模擬與訓練主程式入口
+# ============================================================
+
 # ===== 標準函式庫 =====
-import os
-import json
-import copy
-import random
-import platform
-import unicodedata
-import subprocess
+import os, json, copy, random, platform, unicodedata, subprocess
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-from math import comb
 from collections import Counter, defaultdict, deque, OrderedDict
+
 # ===== 科學運算與數據處理 =====
 import math
+from math import comb
 import numpy as np
+
 # ===== 強化學習環境 =====
 import gymnasium as gym
 from gymnasium import spaces
@@ -21,29 +36,43 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback
+
 # ===== 繪圖與視覺化 =====
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
+
+# ------------------------------------------------------------
+# 工具函式：固定寬度的中日韓文字對齊
+# ------------------------------------------------------------
 def pad_str_fixed_width(s, width):
         length = 0
         for ch in s:
             length += 2 if unicodedata.east_asian_width(ch) in ('F', 'W') else 1
         return s + ' ' * max(0, width - length)
-# ===== 中文字體 =====
+
+# ===== 中文字體設定 =====
 plt.rcParams['font.sans-serif'] = ['Noto Sans CJK TC']
 plt.rcParams['axes.unicode_minus'] = False
-# ---- 全域動作 ID 常數 ----
+
+# ------------------------------------------------------------
+# 全域動作ID定義（共274個動作）
+# ------------------------------------------------------------
+# === action: 出牌 (0~33) ===
 ID_DISCARD_START = 0
 ID_DISCARD_END = 33
+# === action: 過 ===
 ID_PASS = 34
+# === action: 胡 ===
 ID_WIN = 35
+# === action: 吃牌組 (左/中/右) ===
 ID_CHI_L_START = 36
 ID_CHI_L_END = 69
 ID_CHI_M_START = 70
 ID_CHI_M_END = 103
 ID_CHI_R_START = 104
 ID_CHI_R_END = 137
+# === action: 碰 / 槓 / 加槓 / 暗槓 ===
 ID_PONG_START = 138
 ID_PONG_END = 171
 ID_KONG_START = 172
@@ -52,10 +81,21 @@ ID_ADD_KONG_START = 206
 ID_ADD_KONG_END = 239
 ID_CONC_KONG_START = 240
 ID_CONC_KONG_END = 273
-# ========= RewardNet: 學習型 Reward 函式 =========
+
+# ============================================================
+#  RewardNet：學習型獎勵函式 (state, action → reward)
+# ============================================================
 class RewardNet(nn.Module):
+    """
+    RewardNet 是一個神經網路，用來學習 reward function。
+    - 輸入：狀態向量 obs (374維)、動作 action (274維 one-hot)
+    - 輸出：一個 scalar reward 預測值
+    """
+
     def __init__(self, input_dim=374, action_dim=274, hidden_size=256):
         super().__init__()
+
+        # --- state encoder：編碼手牌局面 ---
         self.state_net = nn.Sequential(
             nn.Linear(input_dim, hidden_size),
             nn.LayerNorm(hidden_size),
@@ -63,6 +103,8 @@ class RewardNet(nn.Module):
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU()
         )
+
+        # --- action encoder：編碼動作類別 ---
         self.action_net = nn.Sequential(
             nn.Linear(action_dim, hidden_size // 2),
             nn.LayerNorm(hidden_size // 2),
@@ -70,20 +112,38 @@ class RewardNet(nn.Module):
             nn.Linear(hidden_size // 2, hidden_size),
             nn.ReLU()
         )
+
+        # --- fusion head：融合 state + action ---
         self.fusion = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, 1)
         )
+
     def forward(self, obs, action):
+        """
+        obs: [batch, 374]
+        action: [batch] (長整型 index)
+        """
+        # 將動作轉成 one-hot 向量
         if action.dim() == 1:
             action = F.one_hot(action, num_classes=self.action_net[0].in_features).float()
         s_feat = self.state_net(obs)
         a_feat = self.action_net(action)
         x = th.cat([s_feat, a_feat], dim=-1)
-        return self.fusion(x).squeeze(-1)
+        return self.fusion(x).squeeze(-1)  # reward 預測值
+    
+# ============================================================
+#  MahjongEnv：核心台麻邏輯 + 基礎 reward 計算
+# ============================================================    
 class MahjongEnv:
+    """
+    - 包含：摸牌、出牌、吃碰槓、胡牌檢查等基本規則。
+    - 用於 RL 訓練的基礎環境，不含 PPO step 流程。
+    """
+    
     def __init__(self):
+        # === tile: 麻將牌定義 ===
         self.tile_names = [
             '1萬', '2萬', '3萬', '4萬', '5萬', '6萬', '7萬', '8萬', '9萬',
             '1筒', '2筒', '3筒', '4筒', '5筒', '6筒', '7筒', '8筒', '9筒',
@@ -91,7 +151,9 @@ class MahjongEnv:
             '東', '南', '西', '北', '中', '發', '白'
         ]
         self.tile_to_index = {name: idx for idx, name in enumerate(self.tile_names)}
-        self.deck = []
+        
+        # === 遊戲狀態初始化 ===
+        self.deck = []              # 牌山
         self.players = [{'hand': [], 'discards': [], 'melds': [], 'hidden_melds': []} for _ in range(4)]
         self.current_player = 0
         self.banker = random.randint(0, 3)
@@ -102,25 +164,32 @@ class MahjongEnv:
         self.last_discard_player = None
         self.action_performed = False
         self.tile_claimed = False
+
+        # === reward tracking ===
         self.last_claimed_tile = None
         self.last_discard_efficiency = None
         self.last_action_reward = None
         self.last_action_eff_delta = None
         self.total_reward = 0.0
         self.passed_players_for_current_discard = set()
+        
+        # === reward: 動作獎勵權重表 ===
         self.reward_weights = {
-            "efficiency": 0.6,
-            "ron": 9.0,
-            "tsumo": 11.0,
-            "lose_ron": -7.0,
-            "lose_tsumo": -6.0,
-            "chi": 0.1,
-            "pong": 0.15,
-            "ming_kong": 0.3,
-            "add_kong": 0.3,
-            "concealed_kong": 0.5
+            "efficiency": 0.6,       # 出牌效率懲罰
+            "ron": 9.0,              # 榮和
+            "tsumo": 11.0,           # 自摸
+            "lose_ron": -7.0,        # 被榮和（放槍）
+            "lose_tsumo": -6.0,      # 被自摸
+            "chi": 0.1,              # 吃
+            "pong": 0.15,            # 碰
+            "ming_kong": 0.3,        # 明槓
+            "add_kong": 0.3,         # 加槓
+            "concealed_kong": 0.5    # 暗槓
         }
+
+    # === state: 初始化狀態 ===    
     def reset(self):
+        """重置遊戲，隨機莊家並發牌"""
         self.deck = [i for i in range(34) for _ in range(4)]
         random.shuffle(self.deck)
         self.players = [{'hand': [], 'discards': [], 'melds': [], 'hidden_melds': []} for _ in range(4)]
@@ -136,9 +205,13 @@ class MahjongEnv:
         self.last_action_eff_delta = None
         self.total_reward = 0.0
         self.passed_players_for_current_discard = set()
+        
+        # 每位玩家發16張牌
         for i in range(4):
             self.players[i]['hand'] = sorted([self.deck.pop() for _ in range(16)])
         return self.get_state()
+    
+    # === state: 結構化輸出目前局面 ===
     def get_state(self):
         return {
             'current_player': self.current_player,
@@ -154,6 +227,7 @@ class MahjongEnv:
                 } for p in self.players
             ]
         }
+    
     # =============== 基本動作 ===============
     def draw_tile(self):
         if len(self.deck) <= 16:
@@ -166,6 +240,7 @@ class MahjongEnv:
         self.action_performed = False
         self.tile_claimed = False
         return tile, None
+    
     def discard_tile(self, tile_name):
         if tile_name not in self.tile_to_index:
             return False, f"無效的牌: {tile_name}"
@@ -192,8 +267,10 @@ class MahjongEnv:
         self.passed_players_for_current_discard = set()
         self.last_tile_drawn = None
         return True, None
+    
     def can_pong(self, player_idx, discarded_tile):
         return self.players[player_idx]['hand'].count(discarded_tile) >= 2
+    
     def pong(self, player_idx, tile):
         hand = self.players[player_idx]['hand']
         if hand.count(tile) < 2:
@@ -206,11 +283,14 @@ class MahjongEnv:
         self.last_claimed_tile = self.last_tile_discarded
         self.passed_players_for_current_discard = set()
         return True, None
+    
     def can_kong(self, player_idx, discarded_tile):
         return self.players[player_idx]['hand'].count(discarded_tile) >= 3
+    
     def can_concealed_kong(self, player_idx):
         hand = self.players[player_idx]['hand']
         return sorted([tile for tile, count in Counter(hand).items() if count >= 4])
+    
     def can_add_kong(self, player_idx, drawn_tile):
         hand = self.players[player_idx]['hand']
         possible_kongs = []
@@ -220,6 +300,7 @@ class MahjongEnv:
                 if tile in hand:
                     possible_kongs.append(tile)
         return sorted(list(set(possible_kongs)))
+    
     def kong(self, player_idx, tile):
         hand = self.players[player_idx]['hand']
         if hand.count(tile) < 3:
@@ -231,6 +312,7 @@ class MahjongEnv:
         self.tile_claimed = True
         self.passed_players_for_current_discard = set()
         return True, None
+    
     def concealed_kong(self, player_idx, tile):
         hand = self.players[player_idx]['hand']
         if hand.count(tile) < 4:
@@ -240,6 +322,7 @@ class MahjongEnv:
         self.players[player_idx]['hidden_melds'].append([tile] * 4)
         self.action_performed = True
         return True, None
+    
     def add_kong(self, player_idx, tile):
         hand = self.players[player_idx]['hand']
         for meld in self.players[player_idx]['melds']:
@@ -249,6 +332,7 @@ class MahjongEnv:
                 self.action_performed = True
                 return True, None
         return False, "無可加槓的碰"
+    
     def get_valid_chi_combinations(self, player_idx, discarded_tile):
         hand = self.players[player_idx]['hand']
         tile = discarded_tile
@@ -270,6 +354,7 @@ class MahjongEnv:
                 if all(t in hand for t in seq[1:]):
                     combinations[4] = [self.tile_names[t] for t in seq]
         return combinations
+    
     def chi(self, player_idx, combination):
         if not combination or len(combination) != 3:
             return False, "無效的吃牌組合"
@@ -291,6 +376,7 @@ class MahjongEnv:
         self.last_claimed_tile = self.last_tile_discarded
         self.passed_players_for_current_discard = set()
         return True, None
+    
     def can_win(self, player_idx, tile, is_self_draw=False):
         player = self.players[player_idx]
         hand = player['hand'].copy()
@@ -306,14 +392,17 @@ class MahjongEnv:
         needed_melds = 5 - meld_count
         if remaining_tiles != (needed_melds * 3 + 2):
             return False
+        
         def is_sequence(tiles):
             if len(tiles) != 3 or tiles[0] >= 27:
                 return False
             suit = tiles[0] // 9
             rank = tiles[0] % 9
             return tiles == [suit * 9 + rank, suit * 9 + rank + 1, suit * 9 + rank + 2]
+        
         def is_triplet(tiles):
             return len(tiles) == 3 and tiles[0] == tiles[1] == tiles[2]
+        
         def check_win(hand, melds=None, pairs=None):
             if melds is None:
                 melds = []
@@ -344,6 +433,7 @@ class MahjongEnv:
                         return True
             return False
         return check_win(hand)
+    
     # =============== 入口：step（保留舊呼叫介面） ===============
     def step(self, action):
         if self.game_over:
@@ -401,6 +491,7 @@ class MahjongEnv:
                 self.passed_players_for_current_discard.add(self.current_player)
             return self.get_state(), ""
         return self.get_state(), "無效動作"
+    
     # =============== 產出「動作種類」清單（不含 ID） ===============
     def get_action_menu(self, player_idx, tsumo=False):
         actions = []
@@ -432,6 +523,7 @@ class MahjongEnv:
             for i, tile in enumerate(concealed_kong_tiles[:4], 11):
                 actions.append((i, f"暗槓 {self.tile_names[tile]}"))
         return actions
+    
     # =============== 回傳「動作 ID + 文字」選單（不包含出牌） ===============
     def get_action_id_menu(self, player_idx, tsumo=False):
         id_menu = []
@@ -468,6 +560,7 @@ class MahjongEnv:
             for t in concealed_kong_tiles:
                 id_menu.append((ID_CONC_KONG_START + t, f"暗槓 {self.tile_names[t]}"))
         return id_menu
+    
     def get_action_id_menu_with_eff(self, player_idx: int, tsumo: bool = False):
         base_menu = self.get_action_id_menu(player_idx, tsumo=tsumo)
         base_eff = self._eff_pass_current_context(player_idx, tsumo=tsumo)
@@ -510,6 +603,7 @@ class MahjongEnv:
         self.last_action_rewards = rewards
         self.last_action_base_eff = base_eff
         return id_menu, base_eff, rewards
+    
     # =============== 用 ID 解析成 step 的 action tuple ===============
     def decode_action_id(self, action_id, tsumo=False):
         if ID_DISCARD_START <= action_id <= ID_DISCARD_END:
@@ -567,6 +661,7 @@ class MahjongEnv:
                 tile_idx = action_id - ID_CONC_KONG_START
                 return ('concealed_kong', tile_idx)
         return (None, "無效的動作ID")
+    
     # =============== 輸出 0~273 的動作ID遮罩（1=可執行，0=不可） ===============
     def get_action_id_mask(self, player_idx, tsumo=False):
         idmask = [0] * 274
@@ -621,8 +716,10 @@ class MahjongEnv:
                 for t in range(34):
                     if counts[t] > 0 and (forbid is None or t != forbid):
                         idmask[ID_DISCARD_START + t] = 1
+        
         def slice_range(a, b):
             return idmask[a:b+1]
+        
         table = OrderedDict()
         table['出牌'] = slice_range(0, 33)
         table['過']   = [idmask[34]]
@@ -635,17 +732,20 @@ class MahjongEnv:
         table['加槓']   = slice_range(206, 239)
         table['暗槓']   = slice_range(240, 273)
         return table
+    
     # ======== 手牌效率：工具 ========
     def _hand_to_count(self, hand):
         cnt = [0]*34
         for t in hand:
             cnt[t] += 1
         return cnt
+    
     def _get_used_tiles(self, count, open_tiles):
         used = count[:]
         for t in open_tiles:
             used[t] += 1
         return used
+    
     def _find_max_meld_combinations(self, count):
         results = []
         max_melds = [0]
@@ -691,6 +791,7 @@ class MahjongEnv:
             dfs(cur, path, meld_count, pos + 1)
         dfs(count[:], [])
         return max_melds[0], results
+    
     def _find_max_efficiency_combinations(self, hand_count, used_tiles):
         results = []
         max_eff_count = [0]
@@ -749,6 +850,7 @@ class MahjongEnv:
             dfs(count, path, marked, pos + 1, eff_count)
         dfs(hand_count[:], [], [0] * 34)
         return results, max_eff_count[0]
+    
     def _comb(self, n, k):
         if k < 0 or k > n: return 0
         if k == 0 or k == n: return 1
@@ -759,6 +861,7 @@ class MahjongEnv:
             num *= n - (k - i)
             den *= i
         return num // den
+    
     def _get_efficiency_for_tile(self, tile: int, counts: list[int], total_remaining: int) -> float:
         total = 0
         all_combos = comb(total_remaining, 2)
@@ -774,10 +877,12 @@ class MahjongEnv:
         if counts[tile] >= 2:
             total += comb(counts[tile], 2)
         return (total / all_combos) * 100.0
+    
     def _efficiency_to_prob(self, eff, base):
         if base == 0:
             return 0.0
         return round(eff / base * 100.0, 2)
+    
     def _evaluate_combination(self, melds, count, used_tiles):
         temp_count = count[:]
         for meld in melds:
@@ -820,6 +925,7 @@ class MahjongEnv:
                 best_lonely_eff = lonely_eff
                 best_combo_data = combo
         return (len(melds), best_eff, best_lonely_eff), best_combo_data
+    
     def _find_best_combination(self, meld_combinations, count, used_tiles):
         scores_and_combinations = []
         for melds in meld_combinations:
@@ -830,6 +936,7 @@ class MahjongEnv:
         best_score = scores_and_combinations[0][0]
         best_candidates = [(melds, combo_data) for score, melds, combo_data in scores_and_combinations if score == best_score]
         return best_score, random.choice(best_candidates)
+    
     def _gather_open_tiles_public(self):
         opens = []
         for p in self.players:
@@ -837,6 +944,7 @@ class MahjongEnv:
             for meld in p['melds']:
                 opens.extend(meld)
         return opens
+    
     def _compute_hand_tile_probabilities(self, hand):
         count = self._hand_to_count(hand)
         _, max_meld_combos = self._find_max_meld_combinations(count)
@@ -846,6 +954,7 @@ class MahjongEnv:
         remaining_tiles_total = max(0, 136 - used_tile_num)
         probs = [0.0] * 34
         _best_score, (best_melds, best_combo_data) = self._find_best_combination(max_meld_combos, count, used_tiles)
+        
         def five_run_prob(meld):
             if len(meld) != 5:
                 return None
@@ -858,6 +967,7 @@ class MahjongEnv:
             if e % 9 <= 7: waits.append(e + 1)
             cand = sum(max(0, 4 - used_tiles[w]) for w in waits if 0 <= w < 34) / 2
             return round(100.0 + self._efficiency_to_prob(cand, base=remaining_tiles_total), 2)
+        
         for meld in best_melds:
             p5 = five_run_prob(meld)
             if p5 is not None:
@@ -867,6 +977,7 @@ class MahjongEnv:
                 for t in meld:
                     probs[t] = max(probs[t], 100.0)
         promoted_pair_tile = None
+
         if best_combo_data:
             pair_items = [(tag, tiles, waits, eff) for (tag, tiles, waits, eff) in best_combo_data if tag == "pair"]
             if len(pair_items) == 1:
@@ -878,6 +989,7 @@ class MahjongEnv:
                 p = self._efficiency_to_prob(candidate_eff, base=remaining_tiles_total)
                 for t in tiles:
                     probs[t] = max(probs[t], p)
+        
         temp_count = count[:]
         for meld in best_melds:
             for t in meld:
@@ -896,11 +1008,13 @@ class MahjongEnv:
                 single_prob = self._get_efficiency_for_tile(t, remaining_tiles_list, total_remaining_for_single)
                 probs[t] = max(probs[t], round(single_prob, 2))
         return probs
+    
     def _compute_hand_instance_probabilities(self, hand):
         hand_sorted = sorted(hand)
         eff_map = self.compute_tile_efficiencies(hand_sorted)
         instance_probs = [eff_map[t] for t in hand_sorted]
         return instance_probs
+    
     def compute_tile_efficiencies(self, hand):
         count = self._hand_to_count(hand)
         _, meld_combos = self._find_max_meld_combinations(count)
@@ -909,6 +1023,7 @@ class MahjongEnv:
         used_tile_num = sum(count) + len(open_tiles)
         total_remaining = max(0, 136 - used_tile_num)
         tile_eff_list = {t: [] for t in hand}
+        
         def assign_eff(tile_id, eff):
             if tile_id in tile_eff_list:
                 tile_eff_list[tile_id].append(eff)
@@ -948,6 +1063,7 @@ class MahjongEnv:
                         assign_eff(t, prob)
         result = {t: (min(effs) if effs else 100.0) for t, effs in tile_eff_list.items()}
         return result
+    
     # ======== 整體手牌效率（面子*100 + 候選%） ========
     def _total_efficiency_percent(self, hand_count: list[int], used_tiles: list[int], extra_melds: int = 0) -> float:
         _, meld_combos = self._find_max_meld_combinations(hand_count)
@@ -956,11 +1072,13 @@ class MahjongEnv:
         meld_cnt, _five_cnt, eff_units, _lonely = best_score
         meld_cnt += max(0, int(extra_melds))
         return meld_cnt * 100.0 + self._efficiency_to_prob(eff_units, base=remaining_total)
+    
     def _hand_count_from_list(self, tiles: list[int]) -> list[int]:
         cnt = [0]*34
         for t in tiles:
             cnt[t] += 1
         return cnt
+    
     def _public_used_tiles_with_extra(self, base_count: list[int], extra_used: list[int] | None = None) -> list[int]:
         used = base_count[:]
         opens = self._gather_open_tiles_public()
@@ -973,9 +1091,11 @@ class MahjongEnv:
             if used[i] > 4:
                 used[i] = 4
         return used
+    
     # ======== PASS (過) 的基準效率 ========
     def _existing_meld_cnt(self, player_idx: int) -> int:
         return len(self.players[player_idx]['melds']) + len(self.players[player_idx]['hidden_melds'])
+    
     def _eff_pass_current_context(self, player_idx: int, tsumo: bool) -> float:
         hand = self.players[player_idx]['hand'][:]
         count = self._hand_count_from_list(hand)
@@ -986,6 +1106,7 @@ class MahjongEnv:
             extra = [self.last_tile_discarded] if self.last_tile_discarded is not None else None
             used_tiles = self._public_used_tiles_with_extra(count, extra_used=extra)
         return round(self._total_efficiency_percent(count, used_tiles, extra_melds=extra_melds), 2)
+    
     # ======== 模擬吃／碰／明槓（反應棄牌）後的效率 ========
     def _eff_after_chi(self, player_idx: int, chi_tiles: list[int]) -> float:
         assert self.last_tile_discarded in chi_tiles
@@ -998,6 +1119,7 @@ class MahjongEnv:
         used_tiles = self._public_used_tiles_with_extra(count, extra_used=extra_used)
         extra_melds = self._existing_meld_cnt(player_idx) + 1
         return round(self._total_efficiency_percent(count, used_tiles, extra_melds=extra_melds), 2)
+    
     def _eff_after_pong(self, player_idx: int, tile: int) -> float:
         hand = self.players[player_idx]['hand'][:]
         hand.remove(tile); hand.remove(tile)
@@ -1006,6 +1128,7 @@ class MahjongEnv:
         used_tiles = self._public_used_tiles_with_extra(count, extra_used=extra_used)
         extra_melds = self._existing_meld_cnt(player_idx) + 1
         return round(self._total_efficiency_percent(count, used_tiles, extra_melds=extra_melds), 2)
+    
     def _eff_after_ming_kong(self, player_idx: int, tile: int) -> float:
         hand = self.players[player_idx]['hand'][:]
         for _ in range(3):
@@ -1029,6 +1152,7 @@ class MahjongEnv:
                 weighted_delta += (new_eff - original_eff) * (remaining[i] / sea)
             return round(base_eff + weighted_delta, 2)
         return round(base_eff, 2)
+    
     def _eff_after_add_kong(self, player_idx: int, tile: int) -> float:
         hand = self.players[player_idx]['hand'][:]
         hand.remove(tile)
@@ -1050,6 +1174,7 @@ class MahjongEnv:
                 weighted_delta += (new_eff - original_eff) * (remaining[i] / sea)
             return round(base_eff + weighted_delta, 2)
         return round(base_eff, 2)
+    
     def _eff_after_concealed_kong(self, player_idx: int, tile: int) -> float:
         hand = self.players[player_idx]['hand'][:]
         for _ in range(4):
@@ -1072,6 +1197,7 @@ class MahjongEnv:
                 weighted_delta += (new_eff - original_eff) * (remaining[i] / sea)
             return round(base_eff + weighted_delta, 2)
         return round(base_eff, 2)
+    
     # =============== UI ===============
     def render(self, show_input_prompt=False, after_discard=False, input_tile=None, action_menu=None, tsumo=False, in_tile=None):
         display_deck = max(0, len(self.deck) - 16)
@@ -1164,6 +1290,7 @@ class MahjongEnv:
             preview = self.compute_reward_for_action("discard", eff)
             print(f"(preview) reward: {preview:.4f} (eff={eff:.2f}%)")
         print("---------------------------------")
+    
     def compute_reward_for_action(self, act_type: str, delta: float) -> float:
         raw_reward = 0.0
         if act_type == "chi":
@@ -1180,15 +1307,18 @@ class MahjongEnv:
             eff = max(0.0, min(100.0, delta))
             raw_reward = self.reward_weights["efficiency"] * (0 - eff / 100.0)
         return self._clip_and_normalize(raw_reward)
+    
     def potential(self, player_idx: int = 0) -> float:
         hand = self.players[player_idx]['hand'][:]
         count = self._hand_count_from_list(hand)
         used = self._public_used_tiles_with_extra(count, extra_used=None)
         extra = self._existing_meld_cnt(player_idx)
         return self._total_efficiency_percent(count, used, extra_melds=extra) / 100.0
+    
     def _clip_and_normalize(self, reward: float, min_val=-1.0, max_val=1.0) -> float:
         reward = max(min(reward, max_val), min_val)
         return reward
+    
 def main():
     env = MahjongEnv()
     env.reset()
@@ -1457,6 +1587,7 @@ def main():
             state, msg = env.step(('discard', tile_name))
             os.system('cls' if os.name == 'nt' else 'clear')
             env.render(show_input_prompt=False, after_discard=True)
+
 # ===== 最近N局胡牌率長期加分 =====
 class LongTermWinRateBonus:
     def __init__(self, window=3000, alpha=0.6):
@@ -1480,34 +1611,64 @@ class LongTermWinRateBonus:
                 pass
         bonus_val = scale * self.alpha * (self.current_rate ** 1.5) * 3.0
         return min(bonus_val * 8.0, 3.0)
-# ===== RL 訓練包裝：MahjongRLTrainEnvV2 =====
+# ============================================================
+# MahjongRLTrainEnvV2
+# ============================================================
+# 強化學習專用環境封裝 (符合 gym.Env 規格)
+# - 提供 observation（狀態向量）
+# - 提供 action mask（可執行動作遮罩）
+# - 在 step() 中整合 reward shaping + intrinsic + terminal bonus
+# ============================================================
 class MahjongRLTrainEnvV2(gym.Env):
     metadata = {"render_modes": []}
+
     def __init__(self, log_path="贏局分析.txt", log_enabled=True, winrate_window=5000, winrate_alpha=0.5):
         super().__init__()
+
+        # === 子環境：基本麻將邏輯 ===
         self.env = MahjongEnv()
+
+        # === action: 空間定義（274動作） ===
         self.action_space = spaces.Discrete(274)
+        
+        # === state: 觀測空間 ===
+        # 374 維 (34 張 × [手牌, 進張, 棄牌×4, 副露×4, 暗槓])
         self.observation_space = spaces.Box(low=0, high=4, shape=(374,), dtype=np.int32)
-        self.max_turn_guard = 10000
+        
+        # === 訓練參數 ===
+        self.max_turn_guard = 10000  # 防止死循環
         self._last_info_for_rewards = None
         self.ep_reward_sum = 0.0
         self.log_enabled = log_enabled
         self.log_f = open(log_path, "w", encoding="utf-8") if log_enabled else None
+        
+        # === reward: 長期胡牌率加成 ===
         self.ltwr = LongTermWinRateBonus(window=winrate_window, alpha=winrate_alpha)
+        
+        # === 統計用 ===
         self.episode_counter = 0
         self.log_buffer = []
+
+        # === reward: 使用 RewardNet ===
         self.use_reward_net = True
         self.reward_net = RewardNet()
         self.reward_net_optimizer = th.optim.Adam(self.reward_net.parameters(), lr=1e-4)
+        
+        # === reward: intrinsic scale (探索強度) ===
         self.INTRINSIC_SCALE = 0.05
         self.INTRINSIC_SCALE_BASE = 0.05
         self.total_steps = 0
-    # ========= 工具：把 render() 的輸出行，寫成 txt =========
+    # ------------------------------------------------------------
+    # === 日誌紀錄工具 ===
+    # ------------------------------------------------------------
     def _log(self, s=""):
+        """將訊息寫入緩衝"""
         if not self.log_enabled:
             return
         line = str(s) + ("\n" if not str(s).endswith("\n") else "")
         self.log_buffer.append(line)
+
+    # === 輸出目前局面到 營局紀錄.txt ===    
     def _log_like_render(self, show_masks=True):
         e = self.env
         display_deck = max(0, len(e.deck) - 16)
@@ -1516,11 +1677,17 @@ class MahjongRLTrainEnvV2(gym.Env):
         self._log(f"牌庫剩餘: {display_deck} 張")
         #self._log(f"當前玩家: {player_str}{banker_str}")
         self._log(f"摸牌: {e.tile_names[e.last_tile_drawn] if e.last_tile_drawn is not None else ''}")
+        
+        # 顯示當前玩家手牌
         hand_str = ' '.join(e.tile_names[t] for t in e.players[e.current_player]['hand'])
         self._log(f"  手牌: {hand_str}")
+
+        # 副露（明面）牌
         melds = e.players[e.current_player]['melds']
         meld_str = '[]' if not melds else ' | '.join(' '.join(e.tile_names[t] for t in meld) for meld in melds)
         self._log(f"  鳴牌區: {meld_str}")
+        
+        # 暗槓
         hidden_melds = e.players[e.current_player]['hidden_melds']
         if e.current_player == 0:
             hidden_meld_str = '[]' if not hidden_melds else ' | '.join(' '.join(e.tile_names[t] for t in meld) for meld in hidden_melds)
@@ -1530,11 +1697,13 @@ class MahjongRLTrainEnvV2(gym.Env):
         discards = e.players[e.current_player]['discards']
         discard_str = '[]' if not discards else f"[{', '.join(e.tile_names[t] for t in discards)}]"
         #self._log(f"  棄牌堆: {discard_str}")
+        
         def count_tiles(tile_list):
             counter = [0] * 34
             for t in tile_list:
                 counter[t] += 1
             return counter
+        
         def fmt_row(label, counts):
             pad = lambda x: f"{x}{' ' * (4 - len(str(x)))}"
             return f"{label}: " + ''.join(pad(n) for n in counts)
@@ -1576,6 +1745,7 @@ class MahjongRLTrainEnvV2(gym.Env):
             #for label in ['吃(左)', '吃(中)', '吃(右)', '碰', '明槓', '加槓', '暗槓']:
                 #self._log(pad(label, 6) + ''.join(pad(str(n), 4) for n in table[label]))
         self._log("---------------------------------")
+    
     def _log_player_action(self, pid, text, action_id=None, suffix=None):
         who = "AI" if pid == 0 else f"玩家{pid}"
         if action_id is not None:
@@ -1585,8 +1755,10 @@ class MahjongRLTrainEnvV2(gym.Env):
         if suffix:
             line = f"{line} {suffix}"
         self._log(line)
+
     def _names(self, tiles):
         return ' '.join(self.env.tile_names[t] for t in tiles)
+    
     def _desc_action(self, act_type, param, tsumo_ctx):
         e = self.env
         if act_type == 'discard':
@@ -1611,8 +1783,17 @@ class MahjongRLTrainEnvV2(gym.Env):
         if act_type == 'concealed_kong':
             return f"暗槓 {e.tile_names[param]}"
         return act_type
-    # ========= Gym API =========
+    
+    # ------------------------------------------------------------
+    # === Gym API: reset ===
+    # ------------------------------------------------------------
     def reset(self, seed=None, options=None):
+        """
+        初始化新一局：
+        - 重置 MahjongEnv
+        - 摸第一張牌
+        - 輸出初始 observation
+        """
         super().reset(seed=seed)
         self.log_buffer.clear()
         self.env.reset()
@@ -1620,13 +1801,19 @@ class MahjongRLTrainEnvV2(gym.Env):
         self.ep_length = 0
         obs = self._build_obs()
         self._log("\n===== 新局開始 =====")
+        
         if self.env.game_over:
             return obs, {"action_mask": self._build_action_mask()}
+        
+        # === 開局第一摸 ===
         _state, _msg = self.env.step(('draw', None))
         obs = self._build_obs()
+
+        # === 開局玩家為 AI (index 0) ===
         if self.env.current_player == 0:
             self._log_like_render(show_masks=True)
         else:
+            # 其他電腦玩家隨機出牌
             self._log_player_action(self.env.current_player, "摸牌")
             e = self.env
             player_hand = e.players[e.current_player]['hand']
@@ -1636,20 +1823,49 @@ class MahjongRLTrainEnvV2(gym.Env):
             self._log_player_action(e.current_player, f"打出 {tile_name}", action_id=ID_DISCARD_START + tile)
             _state, _msg = e.step(('discard', tile_name))
             e.last_tile_drawn = None
+        
         return obs, {"action_mask": self._build_action_mask()}
+    
+    # ------------------------------------------------------------
+    # === Gym API: step ===
+    # ------------------------------------------------------------
     def step(self, action):
+        """
+        強化學習核心邏輯：
+        - 處理 AI 出牌 / 鳴牌 / 胡牌
+        - 更新 reward (含 shaping / intrinsic / terminal bonus)
+        - 回傳 (obs, reward, done, info)
+        """
         e = self.env
         reward = 0.0
         self.ep_length += 1
+
+        # === state: 目前潛能 φ(s) ===
+        # φ(s) = 手牌效率分數 (0~5)
         phi_s = e.potential(player_idx=0) if e.current_player == 0 else 0.0
+        
         aid = int(action)
-        END_GAIN_BOOST = 0.5
-        LAMBDA_SHAPING = 0.7
+
+        # === reward shaping 相關常數 ===
+        END_GAIN_BOOST = 0.5     # 胡牌時加成
+        LAMBDA_SHAPING = 0.7     # shaping 比例
+
+        # --------------------------------------------------------
+        # finish(): 用於處理每一步的收尾與終局事件
+        # --------------------------------------------------------
         def finish(terminated=False, end_line=None, end_delta=0.0, info=None):
+            """
+            處理：
+            - 累積 reward
+            - 終局加成 / 懲罰
+            - 長期胡牌率獎勵
+            """            
             total_this_step = reward + (end_delta if terminated else 0.0)
             self.ep_reward_sum += total_this_step
             if info is None:
                 info = {"action_mask": self._build_action_mask()}
+            
+            # === 終局事件類型判定 ===
             if end_line is not None:
                 info["end_line"] = end_line
                 text = str(end_line)
@@ -1670,7 +1886,10 @@ class MahjongRLTrainEnvV2(gym.Env):
                     info["ai_tsumo"] = 1 if evt == "AI_TSUMO" else 0
                     info["ai_deal_in"] = 1 if evt == "AI_DEAL_IN" else 0
                     info["ai_lost_tsumo"] = 1 if evt == "AI_LOST_TSUMO" else 0
+            
             obs = self._build_obs()
+
+            # === 若已結束，加入終局獎勵 ===
             if terminated:
                 if end_line is None:
                     end_line = "終局"
@@ -1678,14 +1897,18 @@ class MahjongRLTrainEnvV2(gym.Env):
                 evt = info.get("terminal_event", None)
                 TERM_WIN_BONUS = 0.5
                 TERM_DEALIN_PENALTY = 0.3
+
                 if evt in ("AI_TSUMO", "AI_RON"):
                     total_this_step += TERM_WIN_BONUS
                     self.ep_reward_sum += TERM_WIN_BONUS
                     self._log(f"[TerminalBonus] win_bonus +{TERM_WIN_BONUS:.2f}")
+                
                 if evt == "AI_DEAL_IN":
                     total_this_step -= TERM_DEALIN_PENALTY
                     self.ep_reward_sum -= TERM_DEALIN_PENALTY
                     self._log(f"[TerminalBonus] deal_in_penalty -{TERM_DEALIN_PENALTY:.2f}")
+                
+                # === reward: 長期胡牌率補償 ===
                 is_win = 1 if evt in ("AI_TSUMO", "AI_RON") else 0
                 self.ltwr.add(is_win)
                 lt_bonus = self.ltwr.bonus()
@@ -1711,19 +1934,34 @@ class MahjongRLTrainEnvV2(gym.Env):
                     "r": self.ep_reward_sum,
                     "l": self.ep_length
                 }
+
             return obs, total_this_step, terminated, False, info
+        
+        # --------------------------------------------------------
+        # Step邏輯主體開始
+        # --------------------------------------------------------
         tsumo_ctx = (e.current_player == 0 and e.last_tile_drawn is not None)
+        
+        # === 取得目前可用動作及預期效率 ===
         action_rewards = {}
         if e.current_player == 0:
             _menu, _base_eff, rewards = e.get_action_id_menu_with_eff(0, tsumo=tsumo_ctx)
             action_rewards = rewards
+
+        # === 將動作ID轉為實際動作 ===    
         act_type, param_or_err = e.decode_action_id(aid, tsumo=tsumo_ctx)
+        
+        # --------------------------------------------------------
+        # reward: 行為對應獎勵
+        # --------------------------------------------------------
         if e.current_player == 0 and act_type is None:
             self._log_like_render(show_masks=True)
             reward = -1.0
             return finish(terminated=False, info={"action_mask": self._build_action_mask(), "invalid_action": True})
         if e.current_player == 0 and act_type is not None:
             desc_for_log = self._desc_action(act_type, param_or_err, tsumo_ctx)
+            
+            # === 胡牌 ===
             if act_type == 'win':
                 is_tsumo = tsumo_ctx
                 _state, _msg = e.step(('win', 'tsumo' if is_tsumo else 'ron'))
@@ -1742,12 +1980,18 @@ class MahjongRLTrainEnvV2(gym.Env):
                         end_line=f"AI胡牌(玩家{from_pid}放槍)->reward+{reward_val}",
                         end_delta=reward_val
                     )
+                
+            # === 過 ===    
             if act_type == 'pass':
                 _state, _msg = e.step(('pass', None))
                 self._log_player_action(0, desc_for_log, action_id=aid, suffix="| reward=+0.0000")
+            
+            # === 吃 / 碰 / 槓類 ===
             elif act_type in ('chi', 'pong', 'kong'):
                 delta_eff = action_rewards.get(aid, 0.0)
                 _state, _msg = e.step((act_type, param_or_err))
+                
+                # === reward: 使用 RewardNet + 基礎reward融合 ===
                 if self.use_reward_net:
                     obs_tensor = th.tensor(self._build_obs(), dtype=th.float32).unsqueeze(0)
                     act_tensor = th.tensor([aid], dtype=th.long)
@@ -1756,6 +2000,7 @@ class MahjongRLTrainEnvV2(gym.Env):
                     reward_val = pred_r
                 else:
                     reward_val = e.compute_reward_for_action(act_type, delta_eff)
+                
                 rb_val = e.compute_reward_for_action(act_type, delta_eff)
                 reward_val = 0.8 * reward_val + 0.2 * rb_val
                 reward += reward_val
@@ -1770,6 +2015,8 @@ class MahjongRLTrainEnvV2(gym.Env):
                     e.last_tile_drawn = None
                 self._log_like_render(show_masks=True)
                 return finish(terminated=False)
+            
+            # === 加槓/暗槓 ===
             elif act_type in ('add_kong', 'concealed_kong'):
                 delta_eff = action_rewards.get(aid, 0.0)
                 _state, _msg = e.step((act_type, param_or_err))
@@ -1790,6 +2037,8 @@ class MahjongRLTrainEnvV2(gym.Env):
                 e.last_tile_drawn = None
                 self._log_like_render(show_masks=True)
                 return finish(terminated=False)
+            
+            # === 出牌 ===
             elif act_type == 'discard':
                 _state, _msg = e.step(('discard', param_or_err))
                 ai_disc_reward = 0.0
@@ -1810,6 +2059,7 @@ class MahjongRLTrainEnvV2(gym.Env):
                         0, desc_for_log, action_id=aid,
                         suffix=f"| reward={ai_disc_reward:+.4f} (eff={eff:.2f}%)"
                     )
+
         if e.last_tile_discarded is not None and e.last_discard_player is not None and not e.tile_claimed:
             claimed = False
             for offset in [1, 2, 3]:
@@ -2020,12 +2270,17 @@ class MahjongRLTrainEnvV2(gym.Env):
                 self._log_player_action(e.current_player, "摸牌")
         if not e.game_over and e.current_player == 0:
             self._log_like_render(show_masks=True)
+        
+        # --------------------------------------------------------
+        # === reward shaping: 潛能差分 φ(s)
+        # --------------------------------------------------------
         self.total_steps += 1
         lambda_shaping = max(0.3, 0.7 * (1 - self.total_steps / 1_000_000))
         gamma = 0.995
         progress = min(1.0, self.total_steps / 1_000_000)
         INTRINSIC_SCALE = 0.05 * (1 - progress) + 0.02 * progress
         PHI_SMOOTH = 0.9
+
         if not hasattr(self, "_prev_phi_s"):
             self._prev_phi_s = phi_s
         phi_s_smooth = PHI_SMOOTH * self._prev_phi_s + (1 - PHI_SMOOTH) * phi_s
@@ -2038,22 +2293,33 @@ class MahjongRLTrainEnvV2(gym.Env):
             self._log(
                 f"[Shaping] φ_s={phi_s_smooth:.3f}, φ_sp={phi_sp:.3f}, shaping={shaping_reward:+.3f}"
             )
+
+        # --------------------------------------------------------
+        # === intrinsic reward: 來自 RewardNet 的探索獎勵 ===
+        # --------------------------------------------------------    
         if self.use_reward_net and hasattr(self, "reward_net") and e.current_player == 0:
             obs_tensor = th.tensor(self._build_obs(), dtype=th.float32).unsqueeze(0)
             act_tensor = th.tensor([aid], dtype=th.long)
             with th.no_grad():
                 intrinsic_raw = self.reward_net(obs_tensor, act_tensor).item()
+            
             progress = min(self.total_steps / 1_000_000, 1.0)
             dynamic_scale = 0.05 * (1 - progress) + 0.02 * progress
+            
+            # 經過 tanh 限幅，乘上比例
             intrinsic = np.tanh(intrinsic_raw) * self.INTRINSIC_SCALE
+            
+            # 攻擊性行為 (吃/碰/槓/胡) 加倍探索獎勵
             offensive = any(k in str(act_type) for k in ["chi", "pong", "kong", "win"])
             if offensive:
                 intrinsic *= 1.5
+
             if not hasattr(self, "_last_intrinsic"):
                 self._last_intrinsic = intrinsic
             intrinsic = 0.8 * self._last_intrinsic + 0.2 * intrinsic
             self._last_intrinsic = intrinsic
             total_reward = reward + intrinsic
+            
             if random.random() < 0.002:
                 self._log(
                     f"[Intrinsic] step={self.total_steps:,} "
@@ -2061,12 +2327,18 @@ class MahjongRLTrainEnvV2(gym.Env):
                     f"→ norm={intrinsic:+.4f} total={total_reward:+.4f}"
                 )
             reward = total_reward
+
         if e.game_over and "AI_TSUMO" in info.get("terminal_event", ""):
             reward += 0.5
         elif e.game_over and "AI_DEAL_IN" in info.get("terminal_event", ""):
             reward -= 0.3
+
+        # --------------------------------------------------------
+        # === reward 最終裁剪 ===
+        # --------------------------------------------------------    
         reward *= 1.2
         reward = max(-1.0, min(1.0, reward))
+        
         info = {
             "shaping_reward": shaping_reward,
             "phi_s": phi_s,
@@ -2074,7 +2346,9 @@ class MahjongRLTrainEnvV2(gym.Env):
             "lambda_shaping": lambda_shaping,
             "gamma": gamma,
         }
+
         return finish(terminated=e.game_over, info=info)
+    
     # ========= 觀測、遮罩建構 =========
     def _build_obs(self):
         e = self.env
@@ -2109,6 +2383,7 @@ class MahjongRLTrainEnvV2(gym.Env):
         vec = hand_counts + in_counts + discard_blocks + meld_blocks + dark_counts
         assert len(vec) == 374
         return np.array(vec, dtype=np.int32)
+    
     def _build_action_mask(self):
         e = self.env
         has_live_discard = (e.last_tile_discarded is not None and e.last_discard_player is not None and not e.tile_claimed)
@@ -2130,17 +2405,23 @@ class MahjongRLTrainEnvV2(gym.Env):
         fill_range(206, 239, table['加槓'])
         fill_range(240, 273, table['暗槓'])
         return mask
+    
     def action_masks(self):
         return self._build_action_mask()
+    
     def close(self):
         if hasattr(self, "log_f") and self.log_f is not None:
             try:
                 self.log_f.close()
             finally:
                 self.log_f = None
-# ==============================================================
-#       EntropyAnnealCallback：動態調整熵係數
-# ==============================================================
+
+# ============================================================
+# EntropyAnnealCallback：動態調整 PPO 熵係數
+# ============================================================
+# 熵（entropy）越高代表策略探索性越強。
+# 此 callback 會隨訓練時間逐步降低 entropy，以收斂策略。
+# ============================================================
 class EntropyAnnealCallback(BaseCallback):
     def __init__(self, total_timesteps, ent_coef_min=0.004, ent_coef_max=0.015, env_ref=None):
         super().__init__()
@@ -2148,20 +2429,26 @@ class EntropyAnnealCallback(BaseCallback):
         self.ent_coef_min = ent_coef_min
         self.ent_coef_max = ent_coef_max
         self.env_ref = env_ref
+
     def _on_step(self) -> bool:
         progress = self.model.num_timesteps / self.total_timesteps
         current_ent = (
             self.ent_coef_max * (1 - progress) + self.ent_coef_min * progress
         )
         self.model.ent_coef = current_ent
+        
+        # 每5萬步輸出一次
         if self.env_ref is not None and hasattr(self.env_ref.envs[0].env, "INTRINSIC_SCALE"):
             env = self.env_ref.envs[0].env
             if self.model.num_timesteps % 50000 == 0:
                 print(f"[Anneal] ent_coef={current_ent:.5f} | intrinsic_scale={env.INTRINSIC_SCALE:.3f}")
         return True
-# ==============================================================
-#    JointTrainCallback：同時訓練 PPO 與 RewardNet
-# ==============================================================
+
+# ============================================================
+# JointTrainCallback：同步訓練 PPO 與 RewardNet
+# ============================================================
+# 在 PPO rollout 結束時，從 buffer 中擷取資料更新 RewardNet。
+# ============================================================
 class JointTrainCallback(BaseCallback):
     def __init__(self, reward_trainer, update_freq=5000, warmup_steps=20000, max_cache=3):
         super().__init__()
@@ -2171,26 +2458,36 @@ class JointTrainCallback(BaseCallback):
         self.max_cache = max_cache
         self.buffer_cache = []
         self.last_update = 0
+
     def _on_step(self) -> bool:
         if self.model.num_timesteps < self.warmup_steps:
             return True
+        
         if self.model.num_timesteps - self.last_update >= self.update_freq:
             rollout = self.model.rollout_buffer
             obs_batch = th.tensor(rollout.observations, dtype=th.float32).view(-1, rollout.observations.shape[-1])
             act_batch = th.tensor(rollout.actions, dtype=th.long).view(-1)
             ret_batch = th.tensor(rollout.returns, dtype=th.float32).view(-1)
+            
+            # shaping rewards（若有）
             if hasattr(rollout, "shaping_rewards"):
                 shaping_batch = th.tensor(rollout.shaping_rewards, dtype=th.float32).view(-1)
             else:
                 shaping_batch = None
+
+            # 快取數據    
             self.buffer_cache.append((obs_batch, act_batch, ret_batch))
             if len(self.buffer_cache) > self.max_cache:
                 self.buffer_cache.pop(0)
+            
+            # 隨機混合舊資料（增強穩定性）
             if len(self.buffer_cache) > 2:
                 old_obs, old_act, old_ret = random.choice(self.buffer_cache[:-1])
                 obs_batch = th.cat([obs_batch, old_obs], dim=0)
                 act_batch = th.cat([act_batch, old_act], dim=0)
                 ret_batch = th.cat([ret_batch, old_ret], dim=0)
+            
+            
             loss = self.reward_trainer.update(
                 obs_batch,
                 act_batch,
@@ -2200,6 +2497,7 @@ class JointTrainCallback(BaseCallback):
             print(f"🎯 RewardNet 更新完成 | loss={loss:.6f} | step={self.model.num_timesteps}")
             self.last_update = self.model.num_timesteps
         return True
+    
     def _on_rollout_end(self) -> None:
         infos = getattr(self.model.rollout_buffer, "infos", None)
         if infos is None:
@@ -2211,7 +2509,13 @@ class JointTrainCallback(BaseCallback):
             else:
                 shaping_rewards.append(0.0)
         self.model.rollout_buffer.shaping_rewards = np.array(shaping_rewards, dtype=np.float32)
-# ========= RewardNet 的訓練器 =========
+
+# ============================================================
+# RewardTrainer：訓練 RewardNet 的輔助類別
+# ============================================================
+# 用於從 PPO 的 rollout buffer 提取資料 (obs, action, return)
+# 來更新 RewardNet，使其學習「回報值 ≈ reward function」。
+# ============================================================
 class RewardTrainer:
     def __init__(self, reward_net, lr=2e-4):
         self.reward_net = reward_net
@@ -2219,57 +2523,92 @@ class RewardTrainer:
         self.loss_fn = th.nn.SmoothL1Loss(beta=0.5)
         self.step_count = 0
         self.prev_target = None
+
+    # === reward: 更新 RewardNet ===    
     def update(self, obs_batch, act_batch, ret_batch, shaping_batch=None):
+        """
+        obs_batch: 狀態批次
+        act_batch: 動作批次
+        ret_batch: 回報批次 (PPO計算出的 return)
+        shaping_batch: shaping 獎勵 (可選，會略微扣除以避免重複學習)
+        """
+        
+        # === 過濾 NaN 回報 ===
         mask = th.isfinite(ret_batch)
         if not mask.any():
             print("⚠️ 無有效回報數據，略過 RewardNet 更新")
             return 0.0
+        
+        # === 過濾後批次 ===
         obs_batch = obs_batch[mask]
         act_batch = act_batch[mask]
         ret_batch = ret_batch[mask].detach()
+        
+        # === 標準化回報 ===
         ret_batch = (ret_batch - ret_batch.mean()) / (ret_batch.std() + 1e-6)
         ret_batch = ret_batch.clamp(-3, 3)
+        
+        # === 平滑歷史平均值以穩定目標 ===
         smooth_alpha = 0.9
         blend_beta = 0.3
         if (not hasattr(self, "prev_target")) or (self.prev_target is None) or (isinstance(self.prev_target, float) and math.isnan(self.prev_target)):
             self.prev_target = ret_batch.mean().detach()
         else:
             self.prev_target = smooth_alpha * self.prev_target + (1 - smooth_alpha) * ret_batch.mean().detach()
+        
+        # 混合歷史均值
         ret_batch = (1 - blend_beta) * ret_batch + blend_beta * self.prev_target
+        
+        # === shaping 補正 ===
         if shaping_batch is not None:
             ret_batch = ret_batch - 0.1 * shaping_batch
+        
+        # === 預測與損失計算 ===
         self.optimizer.zero_grad()
         pred = self.reward_net(obs_batch, act_batch).squeeze()
         loss = self.loss_fn(pred, ret_batch)
+        
+        # === L2 正則化 ===
         reg_loss = 1e-4 * sum(p.pow(2.0).sum() for p in self.reward_net.parameters())
         loss = loss + reg_loss
+
+        # === NaN 防護 ===
         if th.isnan(loss):
             print("⚠️ RewardNet loss 為 NaN，跳過更新")
             return 0.0
+        
+        # === 反向傳遞 ===
         loss.backward()
         th.nn.utils.clip_grad_norm_(self.reward_net.parameters(), max_norm=1.0)
         self.optimizer.step()
 
         self.step_count += 1
+
+        # 每20次印出一次 debug
         if self.step_count % 20 == 0:
             avg_pred = pred.mean().item()
             avg_ret = ret_batch.mean().item()
             print(f"🧩 RewardNet Debug | loss={loss.item():.6f} | pred_mean={avg_pred:+.4f} | ret_mean={avg_ret:+.4f}")
+        
         return loss.item()
+    
 # ===== 便捷包裝，和舊訓練腳本相同操作介面 =====
 def mask_fn(env):
     return env.action_masks()
+
 def get_next_version(path="models"):
     os.makedirs(path, exist_ok=True)
     existing = [d for d in os.listdir(path) if d.startswith("v") and d[1:].isdigit()]
     versions = sorted([int(d[1:]) for d in existing]) if existing else []
     return f"v{(versions[-1] + 1) if versions else 1}"
+
 def get_latest_version(path="models"):
     existing = [d for d in os.listdir(path) if d.startswith("v") and d[1:].isdigit()]
     if not existing:
         return None
     versions = sorted([int(d[1:]) for d in existing])
     return f"v{versions[-1]}"
+
 # === 中文字體設定 ===
 def set_chinese_font():
     plt.rcParams["axes.unicode_minus"] = False
@@ -2310,7 +2649,12 @@ def set_chinese_font():
     plt.rcParams["font.sans-serif"] = [font_family]
     print(f"✅ 成功設定中文字體：{font_family}")
 set_chinese_font()
-# ===== TrainingPlotCallback =====
+
+# ============================================================
+# TrainingPlotCallback：訓練成果繪圖
+# ============================================================
+# 將 reward / loss / 胡牌率 / 放槍率 等指標畫成圖表。
+# ============================================================
 class TrainingPlotCallback(BaseCallback):
     def __init__(self, plot_path="training_plot.png", verbose=1, smooth_window=300, rolling_window=3000, start_ep=3001):
         super().__init__(verbose)
@@ -2327,6 +2671,8 @@ class TrainingPlotCallback(BaseCallback):
         self.updates = []
         self.update_count = 0
         self.rons, self.tsumos, self.deals, self.lost_tsumos = [], [], [], []
+    
+    # === 記錄每局結果 ===
     def _on_step(self) -> bool:
         infos = self.locals["infos"][0]
         if "episode" in infos:
@@ -2352,6 +2698,7 @@ class TrainingPlotCallback(BaseCallback):
             self.deals.append(1 if evt == "AI_DEAL_IN" else 0)
             self.lost_tsumos.append(1 if evt == "AI_LOST_TSUMO" else 0)
         return True
+    
     def _on_rollout_end(self) -> None:
         log_dict = self.model.logger.name_to_value
         if "train/policy_gradient_loss" in log_dict:
@@ -2361,11 +2708,13 @@ class TrainingPlotCallback(BaseCallback):
             self.value_loss.append(log_dict["train/value_loss"])
             self.entropy.append(log_dict["train/entropy_loss"])
             self.explained_variance.append(log_dict["train/explained_variance"])
+    
     # ===== 平滑處理 =====
     def _moving_average(self, data, window_size):
         if len(data) < window_size:
             return np.array(data, dtype=float)
         return np.convolve(data, np.ones(window_size) / window_size, mode="valid")
+    
     # ===== 真實累計率（避免初期暴衝） =====
     def _true_cumulative_rate(self, data, warmup=300, alpha=0.04):
         if len(data) == 0:
@@ -2383,6 +2732,7 @@ class TrainingPlotCallback(BaseCallback):
             else:
                 result[i] = cumsum / (i + 1)
         return result
+    
     # ===== 畫 >= start_ep 之資料 =====
     def _trim_xy(self, x, *ys):
         x = np.asarray(x)
@@ -2394,6 +2744,7 @@ class TrainingPlotCallback(BaseCallback):
             y = np.asarray(y)
             trimmed.append(y[mask])
         return trimmed
+    
     # ===== 動態 margin =====
     def _apply_dynamic_margin(self, ax, data, min_margin=0.05):
         if len(data) == 0:
@@ -2404,10 +2755,12 @@ class TrainingPlotCallback(BaseCallback):
         else:
             margin = (ymax - ymin) * 0.1
         ax.set_ylim(ymin - margin, ymax + margin)
-    # ===== 畫圖 =====
+    
+    # ===== 收尾時畫圖 =====
     def _on_training_end(self) -> None:
         os.makedirs(os.path.dirname(self.plot_path), exist_ok=True)
         fig, axes = plt.subplots(3, 2, figsize=(12, 12))
+        
         # --- Reward ---
         if self.ep_rewards:
             smoothed = self._moving_average(self.ep_rewards, self.smooth_window)
@@ -2417,6 +2770,7 @@ class TrainingPlotCallback(BaseCallback):
             axes[0, 0].set_xlabel("Timesteps")
             axes[0, 0].legend()
             self._apply_dynamic_margin(axes[0, 0], smoothed)
+        
         # --- Policy Loss ---
         if self.policy_loss:
             axes[0, 1].plot(self.updates, self.policy_loss, label="策略損失 (abs)")
@@ -2424,6 +2778,7 @@ class TrainingPlotCallback(BaseCallback):
             axes[0, 1].set_xlabel("更新次數")
             axes[0, 1].legend()
             self._apply_dynamic_margin(axes[0, 1], self.policy_loss)
+        
         # --- Value Loss ---
         if self.value_loss:
             axes[1, 0].plot(self.updates, self.value_loss, label="價值損失", color="orange")
@@ -2431,6 +2786,7 @@ class TrainingPlotCallback(BaseCallback):
             axes[1, 0].set_xlabel("更新次數")
             axes[1, 0].legend()
             self._apply_dynamic_margin(axes[1, 0], self.value_loss)
+        
         # --- Explained Variance ---
         if self.explained_variance:
             axes[1, 1].plot(self.updates, self.explained_variance, label="解釋變異 (Explained Variance)", color="green")
@@ -2438,6 +2794,7 @@ class TrainingPlotCallback(BaseCallback):
             axes[1, 1].set_xlabel("更新次數")
             axes[1, 1].legend()
             self._apply_dynamic_margin(axes[1, 1], self.explained_variance)
+        
         # --- Win Source ---
         if self.rons and self.tsumos:
             n = len(self.rons)
@@ -2473,6 +2830,7 @@ class TrainingPlotCallback(BaseCallback):
             if dyn_data:
                 self._apply_dynamic_margin(axes[2, 0], np.array(dyn_data))
             axes[2, 0].grid(alpha=0.3)
+        
         # --- Loss Source ---
         if self.deals and self.lost_tsumos:
             n = len(self.deals)
@@ -2512,6 +2870,16 @@ class TrainingPlotCallback(BaseCallback):
         plt.savefig(self.plot_path)
         plt.close(fig)
         print(f"📊 訓練圖已儲存至 {self.plot_path}")
+
+# ============================================================
+#     主程式入口 (__main__)
+# ============================================================
+#     提供互動式選單：
+#     [0] 單局模擬
+#     [1] 新訓練版本
+#     [2] 接續最新版本
+#     [3] 接續訓練指定版本
+# ============================================================
 if __name__ == "__main__":
     print("請選擇：")
     print("[0] 測試模擬一局")
@@ -2519,6 +2887,8 @@ if __name__ == "__main__":
     print("[2] 接續訓練最新版本")
     print("[3] 接續訓練指定版本")
     choice = input("你的選擇：").strip()
+
+    # === 建立新版本 / 接續版本 ===
     if choice == "0":
         env = DummyVecEnv([lambda: ActionMasker(MahjongRLTrainEnvV2(log_path="贏局分析.txt"), mask_fn)])
         obs = env.reset()
@@ -2658,3 +3028,11 @@ if __name__ == "__main__":
     print(f"✅ 訓練完成並儲存版本：{version}")
     print(f"💾 已儲存 VecNormalize：{vecnorm_path}")
     env.close()
+
+    # === 訓練流程 ===
+    # → 這裡主要完成：
+    #   - 讀取 /models/vX/ 中的模型與 RewardNet
+    #   - 使用 PPO 訓練 100 萬步
+    #   - 每 5000 step 更新 RewardNet
+    #   - 訓練完畢儲存所有狀態與圖表
+    # ============================================================
