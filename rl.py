@@ -38,7 +38,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback
 
 # ===== 繪圖與視覺化 =====
-import matplotlib
+import csv, matplotlib
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
@@ -2802,73 +2802,79 @@ class TrainingPlotCallback(BaseCallback):
             cum_ron = self._true_cumulative_rate(self.rons)
             cum_tsumo = self._true_cumulative_rate(self.tsumos)
             cum_winrate = cum_ron + cum_tsumo
-            trimmed = self._trim_xy(x_ep, cum_ron, cum_tsumo, cum_winrate)
+            trimmed = self._trim_xy(x_ep, cum_winrate)
             if trimmed is not None:
-                x_c, cum_ron_c, cum_tsumo_c, cum_winrate_c = trimmed
-                axes[2, 0].plot(x_c, cum_ron_c, label="累積榮和率", color="blue", alpha=0.7)
-                axes[2, 0].plot(x_c, cum_tsumo_c, label="累積自摸率", color="green", alpha=0.7)
-                axes[2, 0].plot(x_c, cum_winrate_c, label="累積胡牌率", color="purple", linewidth=2)
-            roll_ron = self._moving_average(self.rons, self.rolling_window)
-            roll_tsumo = self._moving_average(self.tsumos, self.rolling_window)
-            roll_winrate = roll_ron + roll_tsumo
-            if len(roll_ron) > 0:
-                x_roll_full = np.arange(n - len(roll_ron) + 1, n + 1)
-                trimmed_roll = self._trim_xy(x_roll_full, roll_ron, roll_tsumo, roll_winrate)
-                if trimmed_roll is not None:
-                    xr, rr, rt, rw = trimmed_roll
-                    axes[2, 0].plot(xr, rr, "--", label=f"近{self.rolling_window}局榮和率", color="blue")
-                    axes[2, 0].plot(xr, rt, "--", label=f"近{self.rolling_window}局自摸率", color="green")
-                    axes[2, 0].plot(xr, rw, "--", label=f"近{self.rolling_window}局胡牌率", color="purple", linewidth=2)
-            axes[2, 0].set_title("胡牌來源")
+                x_c, cum_winrate_c = trimmed
+                axes[2, 0].plot(x_c, cum_winrate_c, label="累積胡牌率", color="blue", linewidth=2)
+            axes[2, 0].set_title("胡牌機率")
             axes[2, 0].set_xlabel("局數")
             axes[2, 0].legend()
-            dyn_data = []
             if trimmed is not None:
-                dyn_data += list(cum_ron_c) + list(cum_tsumo_c) + list(cum_winrate_c)
-            if len(roll_ron) > 0 and trimmed_roll is not None:
-                dyn_data += list(rr) + list(rt) + list(rw)
-            if dyn_data:
-                self._apply_dynamic_margin(axes[2, 0], np.array(dyn_data))
+                self._apply_dynamic_margin(axes[2, 0], np.array(cum_winrate_c))
             axes[2, 0].grid(alpha=0.3)
         
         # --- Loss Source ---
-        if self.deals and self.lost_tsumos:
+        if self.deals:
             n = len(self.deals)
             x_ep = np.arange(1, n + 1)
             cum_deal = self._true_cumulative_rate(self.deals)
-            cum_lost = self._true_cumulative_rate(self.lost_tsumos)
-            cum_lossrate = cum_deal + cum_lost
-            trimmed = self._trim_xy(x_ep, cum_deal, cum_lost, cum_lossrate)
+            trimmed = self._trim_xy(x_ep, cum_deal)
             if trimmed is not None:
-                x_c, cum_deal_c, cum_lost_c, cum_lossrate_c = trimmed
-                axes[2, 1].plot(x_c, cum_deal_c, label="累積放槍率", color="red", alpha=0.7)
-                axes[2, 1].plot(x_c, cum_lost_c, label="累積被自摸率", color="orange", alpha=0.7)
-                axes[2, 1].plot(x_c, cum_lossrate_c, label="累積失分率", color="black", linewidth=2)
-            roll_deal = self._moving_average(self.deals, self.rolling_window)
-            roll_lost = self._moving_average(self.lost_tsumos, self.rolling_window)
-            roll_lossrate = roll_deal + roll_lost
-            if len(roll_deal) > 0:
-                x_roll_full = np.arange(n - len(roll_deal) + 1, n + 1)
-                trimmed_roll = self._trim_xy(x_roll_full, roll_deal, roll_lost, roll_lossrate)
-                if trimmed_roll is not None:
-                    xr, rd, rl, rloss = trimmed_roll
-                    axes[2, 1].plot(xr, rd, "--", label=f"近{self.rolling_window}局放槍率", color="red")
-                    axes[2, 1].plot(xr, rl, "--", label=f"近{self.rolling_window}局被自摸率", color="orange")
-                    axes[2, 1].plot(xr, rloss, "--", label=f"近{self.rolling_window}局失分率", color="black", linewidth=2)
-            axes[2, 1].set_title("失分來源")
+                x_c, cum_deal_c = trimmed
+                axes[2, 1].plot(x_c, cum_deal_c, label="累積放槍率", color="red", linewidth=2)
+            axes[2, 1].set_title("放槍機率")
             axes[2, 1].set_xlabel("局數")
             axes[2, 1].legend()
-            dyn_data = []
             if trimmed is not None:
-                dyn_data += list(cum_deal_c) + list(cum_lost_c) + list(cum_lossrate_c)
-            if len(roll_deal) > 0 and trimmed_roll is not None:
-                dyn_data += list(rd) + list(rl) + list(rloss)
-            if dyn_data:
-                self._apply_dynamic_margin(axes[2, 1], np.array(dyn_data))
+                self._apply_dynamic_margin(axes[2, 1], np.array(cum_deal_c))
             axes[2, 1].grid(alpha=0.3)
+
         plt.tight_layout()
         plt.savefig(self.plot_path)
         plt.close(fig)
+
+        csv_path = os.path.splitext(self.plot_path)[0] + "_summary.csv"
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+        if self.rons and self.tsumos:
+            n = len(self.rons)
+            cum_ron = np.cumsum(self.rons)
+            cum_tsumo = np.cumsum(self.tsumos)
+            cum_win = cum_ron + cum_tsumo
+
+            # === 讀取舊紀錄 ===
+            last_ep_offset = 0
+            last_total_wins = 0.0
+            last_rate = 0.0
+            file_exists = os.path.exists(csv_path)
+
+            if file_exists:
+                with open(csv_path, "r", encoding="utf-8") as f:
+                    rows = list(csv.reader(f))
+                    if len(rows) > 1:
+                        last_row = rows[-1]
+                        try:
+                            last_ep_offset = int(last_row[0])
+                            last_rate = float(last_row[1])
+                            last_total_wins = last_ep_offset * last_rate
+                            print(f"🔁 偵測到舊紀錄：從第 {last_ep_offset+1} 局繼續，累積胡牌 {last_total_wins:.2f}")
+                        except Exception as e:
+                            print(f"⚠️ 舊紀錄解析失敗：{e}")
+
+            # === 累積加總（正確接續）===
+            total_eps = np.arange(1, n + 1) + last_ep_offset
+            total_wins = last_total_wins + np.cumsum(self.rons) + np.cumsum(self.tsumos)
+            cum_winrate = total_wins / total_eps
+
+            # === 附加寫入 CSV ===
+            with open(csv_path, "a" if file_exists else "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(["局數", "累積胡牌率"])
+                for ep, rate in zip(total_eps, cum_winrate):
+                    writer.writerow([int(ep), round(rate, 4)])
+
+            print(f"📈 已更新胡牌率統計：{csv_path}")
         print(f"📊 訓練圖已儲存至 {self.plot_path}")
 
 # ============================================================
@@ -3000,7 +3006,7 @@ if __name__ == "__main__":
             state = json.load(f)
             reward_trainer.step_count = state.get("reward_step_count", 0)
             print(f"🔁 接續 RewardTrainer 步數：{reward_trainer.step_count}")
-    total_steps = 1_000_000
+    total_steps = 100000    #1_000_000
     plot_cb = TrainingPlotCallback(plot_path=f"models/{version}/training_plot.png")
     anneal_cb = EntropyAnnealCallback(total_timesteps=total_steps, ent_coef_min=0.006, ent_coef_max=0.02)
     joint_cb = JointTrainCallback(reward_trainer, update_freq=5_000, warmup_steps=20_000)
