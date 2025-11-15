@@ -1610,7 +1610,7 @@ class LongTermWinRateBonus:
             except Exception:
                 pass
         bonus_val = scale * self.alpha * (self.current_rate ** 1.5) * 3.0
-        return min(bonus_val * 8.0, 3.0)
+        return 0.0  #min(bonus_val * 8.0, 3.0)
 # ============================================================
 # MahjongRLTrainEnvV2
 # ============================================================
@@ -1735,7 +1735,7 @@ class MahjongRLTrainEnvV2(gym.Env):
         #self._log(fmt_row("暗0", hidden_counts))
         if show_masks:
             has_live_discard = (e.last_tile_discarded is not None and e.last_discard_player is not None and not e.tile_claimed)
-            tsumo_ctx = (e.current_player == 0 and e.last_tile_drawn is not None and not has_live_discard)
+            tsumo_ctx = (e.current_player == 0 and e.last_tile_drawn is not None)
             table = e.get_action_id_mask(player_idx=0, tsumo=tsumo_ctx)
             pad = lambda s, w: f"{s}{' ' * (w - len(s))}"
             #self._log("種類  " + ''.join(pad(name, 4) for name in e.tile_names))
@@ -2387,7 +2387,7 @@ class MahjongRLTrainEnvV2(gym.Env):
     def _build_action_mask(self):
         e = self.env
         has_live_discard = (e.last_tile_discarded is not None and e.last_discard_player is not None and not e.tile_claimed)
-        tsumo_ctx = (e.current_player == 0 and e.last_tile_drawn is not None and not has_live_discard)
+        tsumo_ctx = (e.current_player == 0 and e.last_tile_drawn is not None)
         table = e.get_action_id_mask(player_idx=0, tsumo=tsumo_ctx)
         mask = np.zeros(274, dtype=bool)
         def fill_range(start, end, arr):
