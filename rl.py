@@ -1696,7 +1696,7 @@ class MahjongRLTrainEnvV2(gym.Env):
         self._log(f"  暗槓區: {hidden_meld_str}")
         discards = e.players[e.current_player]['discards']
         discard_str = '[]' if not discards else f"[{', '.join(e.tile_names[t] for t in discards)}]"
-        #self._log(f"  棄牌堆: {discard_str}")
+        self._log(f"  棄牌堆: {discard_str}")
         
         def count_tiles(tile_list):
             counter = [0] * 34
