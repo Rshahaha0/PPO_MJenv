@@ -1622,7 +1622,7 @@ class LongTermWinRateBonus:
 class MahjongRLTrainEnvV2(gym.Env):
     metadata = {"render_modes": []}
 
-    def __init__(self, log_path="贏局分析.txt", log_enabled=True, winrate_window=5000, winrate_alpha=0.5):
+    def __init__(self, log_path="贏局紀錄.txt", log_enabled=True, winrate_window=5000, winrate_alpha=0.5):
         super().__init__()
 
         # === 子環境：基本麻將邏輯 ===
@@ -2651,6 +2651,54 @@ def set_chinese_font():
 set_chinese_font()
 
 # ============================================================
+#                       紀錄局數與胡牌率
+# ============================================================
+class WinRateLoggerCallback(BaseCallback):
+    def __init__(self, log_path="winrate_log.csv", verbose=1):
+        super().__init__(verbose)
+        self.log_path = log_path
+
+        # 若不存在 → 建立並寫入標題
+        if not os.path.exists(self.log_path):
+            with open(self.log_path, "w", encoding="utf-8") as f:
+                f.write("round,win_count,win_rate\n")
+            self.round_count = 0
+            self.win_count = 0
+
+        else:
+            # 若已經存在 → 讀取最後一筆資料，接續寫
+            with open(self.log_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()[1:]  # skip header
+                if len(lines) == 0:
+                    self.round_count = 0
+                    self.win_count = 0
+                else:
+                    last = lines[-1].strip().split(",")
+                    self.round_count = int(last[0])
+                    self.win_count = int(last[1])
+
+            print(f"🔁 WinRateLogger 接續累積：round={self.round_count}, win={self.win_count}")
+
+    def _on_step(self) -> bool:
+        dones = self.locals["dones"]
+        infos = self.locals["infos"]
+
+        if dones[0]:
+            self.round_count += 1
+
+            evt = infos[0].get("terminal_event", None)
+
+            if evt in ("AI_TSUMO", "AI_RON"):
+                self.win_count += 1
+
+            win_rate = self.win_count / self.round_count
+
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(f"{self.round_count},{self.win_count},{win_rate:.6f}\n")
+
+        return True
+
+# ============================================================
 # TrainingPlotCallback：訓練成果繪圖
 # ============================================================
 # 將 reward / loss / 胡牌率 / 放槍率 等指標畫成圖表。
@@ -2832,49 +2880,6 @@ class TrainingPlotCallback(BaseCallback):
         plt.tight_layout()
         plt.savefig(self.plot_path)
         plt.close(fig)
-
-        csv_path = os.path.splitext(self.plot_path)[0] + "_summary.csv"
-        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-
-        if self.rons and self.tsumos:
-            n = len(self.rons)
-            cum_ron = np.cumsum(self.rons)
-            cum_tsumo = np.cumsum(self.tsumos)
-            cum_win = cum_ron + cum_tsumo
-
-            # === 讀取舊紀錄 ===
-            last_ep_offset = 0
-            last_total_wins = 0.0
-            last_rate = 0.0
-            file_exists = os.path.exists(csv_path)
-
-            if file_exists:
-                with open(csv_path, "r", encoding="utf-8") as f:
-                    rows = list(csv.reader(f))
-                    if len(rows) > 1:
-                        last_row = rows[-1]
-                        try:
-                            last_ep_offset = int(last_row[0])
-                            last_rate = float(last_row[1])
-                            last_total_wins = last_ep_offset * last_rate
-                            print(f"🔁 偵測到舊紀錄：從第 {last_ep_offset+1} 局繼續，累積胡牌 {last_total_wins:.2f}")
-                        except Exception as e:
-                            print(f"⚠️ 舊紀錄解析失敗：{e}")
-
-            # === 累積加總（正確接續）===
-            total_eps = np.arange(1, n + 1) + last_ep_offset
-            total_wins = last_total_wins + np.cumsum(self.rons) + np.cumsum(self.tsumos)
-            cum_winrate = total_wins / total_eps
-
-            # === 附加寫入 CSV ===
-            with open(csv_path, "a" if file_exists else "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                if not file_exists:
-                    writer.writerow(["局數", "累積胡牌率"])
-                for ep, rate in zip(total_eps, cum_winrate):
-                    writer.writerow([int(ep), round(rate, 4)])
-
-            print(f"📈 已更新胡牌率統計：{csv_path}")
         print(f"📊 訓練圖已儲存至 {self.plot_path}")
 
 # ============================================================
@@ -2896,7 +2901,7 @@ if __name__ == "__main__":
 
     # === 建立新版本 / 接續版本 ===
     if choice == "0":
-        env = DummyVecEnv([lambda: ActionMasker(MahjongRLTrainEnvV2(log_path="贏局分析.txt"), mask_fn)])
+        env = DummyVecEnv([lambda: ActionMasker(MahjongRLTrainEnvV2(log_path="贏局紀錄.txt"), mask_fn)])
         obs = env.reset()
         done = False
         step = 0
@@ -3006,14 +3011,15 @@ if __name__ == "__main__":
             state = json.load(f)
             reward_trainer.step_count = state.get("reward_step_count", 0)
             print(f"🔁 接續 RewardTrainer 步數：{reward_trainer.step_count}")
-    total_steps = 100000    #1_000_000
+    total_steps = 1_000_000
     plot_cb = TrainingPlotCallback(plot_path=f"models/{version}/training_plot.png")
     anneal_cb = EntropyAnnealCallback(total_timesteps=total_steps, ent_coef_min=0.006, ent_coef_max=0.02)
     joint_cb = JointTrainCallback(reward_trainer, update_freq=5_000, warmup_steps=20_000)
+    winrate_cb = WinRateLoggerCallback(log_path="winrate_log.csv")
     model.learn(
         total_timesteps=total_steps,
         reset_num_timesteps=True,
-        callback=[joint_cb, plot_cb, anneal_cb]
+        callback=[joint_cb, plot_cb, anneal_cb, winrate_cb]
     )
     ltwr_state_path = f"models/{version}/ltwr_state.json"
     ltwr = env.envs[0].env.ltwr
